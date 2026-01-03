@@ -1,0 +1,348 @@
+---
+title: "MDA611 Assignment 2 — Predictive Analytics"
+author: ""
+date: "`r format(Sys.Date(), '%d %B %Y')`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    theme: flatly
+  word_document:
+    toc: true
+    toc_depth: 3
+editor_options:
+  chunk_output_type: console
+---
+
+# Cover Page
+
+**Unit:** MDA611 Predictive Analytics  
+**Assessment:** Assignment 2 (Group)  
+**Dataset:** `shopDataAssignment2.csv` (≈3900 rows × 18 columns)  
+**Target:** `Frequency.of.Purchases` (multi-valued classification)
+
+---
+
+# Task 0 — Setup
+
+```{r setup, message=FALSE, warning=FALSE}
+set.seed(42)
+
+install_if_missing <- function(pkgs) {
+  to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+  if (length(to_install) > 0) install.packages(to_install, dependencies = TRUE)
+}
+
+install_if_missing(c(
+  "tidyverse","data.table","janitor","lubridate","skimr",
+  "caret","ranger","xgboost","e1071","forcats","ggplot2",
+  "yardstick","rpart","rpart.plot","vip","ggrepel","stringr","GGally"
+))
+
+library(tidyverse)
+library(data.table)
+library(janitor)
+library(lubridate)
+library(skimr)
+library(caret)
+library(ranger)
+library(xgboost)
+library(e1071)
+library(forcats)
+library(ggplot2)
+library(vip)
+library(ggrepel)
+library(stringr)
+library(GGally)
+
+options(width = 120)
+theme_set(theme_minimal())
+```
+
+```{r paths}
+DATA_CSV <- "shopDataAssignment2.csv"
+stopifnot(file.exists(DATA_CSV))
+```
+
+---
+
+# Task 1 — Pre-processing (Cleaning, Ethics, Feature Engineering)
+
+```{r load_clean_convert, message=FALSE, warning=FALSE}
+dt_raw <- fread(DATA_CSV)
+df <- as.data.frame(dt_raw)
+df <- clean_names(df)
+
+glimpse(df)
+skimr::skim(df)
+
+df$frequency_of_purchases <- as.factor(df$frequency_of_purchases)
+levels(df$frequency_of_purchases) <- make.names(levels(df$frequency_of_purchases))
+
+id_like <- names(df)[str_detect(names(df), regex("id$|^id|customer|user", ignore_case = TRUE))]
+id_like <- unique(intersect(id_like, names(df)))
+
+cat_cols <- names(df)[sapply(df, is.character) | sapply(df, is.factor)]
+num_cols <- names(df)[sapply(df, is.numeric)]
+
+for (c in setdiff(cat_cols, "frequency_of_purchases")) {
+  df[[c]] <- as.factor(df[[c]])
+}
+
+collapse_high_card <- function(x, max_levels = 6) {
+  if (!is.factor(x)) return(x)
+  if (nlevels(x) <= max_levels) return(x)
+  fct_lump(x, n = max_levels - 1, other_level = "Other")
+}
+df <- df %>% mutate(across(.cols = where(is.factor) & !matches("^frequency_of_purchases$"), .fns = ~ collapse_high_card(.x, 6)))
+
+impute_mode <- function(v) {
+  v2 <- as.character(v)
+  tab <- table(v2, useNA = "no")
+  if (length(tab) == 0) return(factor(v))
+  m <- names(sort(tab, decreasing = TRUE))[1]
+  v2[is.na(v2) | v2 == ""] <- m
+  factor(v2)
+}
+df <- df %>% mutate(across(where(is.numeric), ~ ifelse(is.na(.x), median(.x, na.rm = TRUE), .x)))
+df <- df %>% mutate(across(where(is.factor) & !matches("^frequency_of_purchases$"), ~ impute_mode(.x)))
+
+top_class <- df %>% count(frequency_of_purchases, sort = TRUE) %>% arrange(desc(n)) %>% slice_head(n = 1) %>% pull(frequency_of_purchases)
+df$freq_top_vs_rest <- factor(ifelse(df$frequency_of_purchases == top_class, "Top", "Rest"))
+
+glimpse(df)
+```
+
+---
+
+# Task 2 — Exploratory Data Analysis (EDA)
+
+```{r eda, fig.width=7, fig.height=4}
+# Target distribution
+df %>% count(frequency_of_purchases) %>% mutate(prop = n/sum(n)) -> class_dist
+class_dist
+
+ggplot(class_dist, aes(x = frequency_of_purchases, y = n)) +
+  geom_col(fill = "steelblue") + geom_text(aes(label = n), vjust = -0.3) +
+  labs(title = "Frequency.of.Purchases distribution", x = "Class", y = "Count")
+
+# Numeric distributions
+df %>% select(all_of(num_cols)) %>%
+  gather(var, value) %>%
+  ggplot(aes(x = value, fill = var)) +
+  geom_histogram(bins = 30, alpha = 0.6) +
+  facet_wrap(~ var, scales = "free") +
+  labs(title = "Numeric variable distributions")
+
+# Correlation heatmap
+ggcorr(df[, num_cols], label = TRUE, hjust = 1, size = 3) +
+  labs(title = "Correlation heatmap of numeric variables")
+
+# Categorical vs Target (example with first two categorical predictors)
+for (col in head(setdiff(cat_cols, "frequency_of_purchases"), 2)) {
+  print(
+    ggplot(df, aes_string(x = col, fill = "frequency_of_purchases")) +
+      geom_bar(position = "fill") +
+      labs(title = paste("Distribution of", col, "by Purchase Frequency"), y = "Proportion")
+  )
+}
+```
+
+---
+
+# Task 3 — EDA findings and model justification
+
+- Random Forest is being chosen for handling mixed data types and interpretability.  
+- XGBoost is being chosen for performance with boosted trees.  
+
+---
+
+# Task 4 — Modelling
+
+```{r split_and_prep}
+preds_all <- setdiff(names(df), c("frequency_of_purchases", "freq_top_vs_rest", id_like))
+
+set.seed(42)
+train_idx <- createDataPartition(df$frequency_of_purchases, p = 0.8, list = FALSE)
+train_df <- df[train_idx, , drop = FALSE]
+test_df  <- df[-train_idx, , drop = FALSE]
+
+for (v in names(train_df)) {
+  if (is.factor(train_df[[v]])) {
+    test_df[[v]] <- factor(test_df[[v]], levels = levels(train_df[[v]]))
+  }
+}
+
+ctrl <- trainControl(method = "repeatedcv", number = 5, repeats = 2, classProbs = TRUE, savePredictions = "final")
+
+
+# removing near-zero variance predictors to avoid caret xgbTree errors
+nzv <- nearZeroVar(train_df[, preds_all, drop = FALSE])
+if (length(nzv) > 0) {
+  preds_all <- preds_all[-nzv]
+}
+
+```
+
+## Model 1 — Random Forest
+
+```{r model_rf, message=FALSE, warning=FALSE}
+rf_grid <- expand.grid(mtry = max(1, floor(sqrt(length(preds_all)))), splitrule = "gini", min.node.size = 5)
+
+set.seed(42)
+fit_rf <- train(
+  x = train_df[, preds_all, drop = FALSE],
+  y = train_df$frequency_of_purchases,
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = rf_grid,
+  importance = "impurity",
+  num.trees = 500,
+  metric = "Accuracy"
+)
+
+fit_rf
+plot(varImp(fit_rf), top = 20, main = "RF - Variable Importance")
+```
+
+## Model 2 — XGBoost
+
+```{r model_xgb, message=FALSE, warning=FALSE}
+
+# building one-hot encoded matrix from training and test
+mm_train <- model.matrix(frequency_of_purchases ~ . , data = train_df[, c(preds_all, "frequency_of_purchases")])
+mm_test  <- model.matrix(frequency_of_purchases ~ . , data = test_df[, c(preds_all, "frequency_of_purchases")])
+
+# extracting labels
+y_train <- train_df$frequency_of_purchases
+y_test  <- test_df$frequency_of_purchases
+
+# converting to numeric indices for xgboost
+label_train <- as.numeric(y_train) - 1
+label_test  <- as.numeric(y_test) - 1
+
+# preparing DMatrix
+dtrain <- xgb.DMatrix(data = mm_train, label = label_train)
+dtest  <- xgb.DMatrix(data = mm_test, label = label_test)
+
+# training a simple xgboost model
+set.seed(42)
+fit_xgb <- xgboost(
+  data = dtrain,
+  objective = "multi:softmax",
+  num_class = length(levels(y_train)),
+  nrounds = 50,
+  max_depth = 4,
+  eta = 0.1,
+  subsample = 0.8,
+  colsample_bytree = 0.8,
+  verbose = 0
+)
+
+# predicting on test
+pred_xgb <- predict(fit_xgb, dtest)
+pred_xgb <- factor(levels(y_train)[pred_xgb + 1], levels = levels(y_train))
+
+# evaluating
+cm_xgb <- caret::confusionMatrix(pred_xgb, y_test)
+cm_xgb
+
+
+# compute feature importance
+imp_mat <- xgb.importance(model = fit_xgb)
+
+# top variables
+head(imp_mat, 10)
+
+# plot importance
+xgb.plot.importance(imp_mat[1:15], main = "XGBoost - Top 15 Important Features")
+
+
+```
+
+---
+
+# Task 5 — Evaluation
+
+```{r eval_models}
+# helper function for metrics
+compute_metrics <- function(truth, preds) {
+  cm <- caret::confusionMatrix(preds, truth)
+  byclass <- cm$byClass
+  if (is.matrix(byclass)) {
+    f1s <- byclass[, "F1"]
+    macro_f1 <- mean(f1s, na.rm = TRUE)
+  } else {
+    macro_f1 <- as.numeric(byclass["F1"])
+  }
+  list(confusion = cm$table, accuracy = cm$overall["Accuracy"], macroF1 = macro_f1)
+}
+
+# RF evaluation
+pred_rf <- predict(fit_rf, newdata = test_df[, preds_all, drop = FALSE])
+m_rf <- compute_metrics(test_df$frequency_of_purchases, pred_rf)
+
+# XGB evaluation (already predicted earlier as pred_xgb)
+m_xgb <- compute_metrics(y_test, pred_xgb)
+
+m_rf
+m_xgb
+```
+
+---
+
+# Task 6 — Model improvement
+
+```{r Model_improvement}
+# tuning Random Forest with different mtry values
+rf_tune_grid <- expand.grid(mtry = c(2, 5, 10), splitrule = "gini", min.node.size = 5)
+
+set.seed(42)
+fit_rf_tuned <- train(
+  x = train_df[, preds_all, drop = FALSE],
+  y = train_df$frequency_of_purchases,
+  method = "ranger",
+  trControl = ctrl,
+  tuneGrid = rf_tune_grid,
+  num.trees = 500,
+  metric = "Accuracy"
+)
+
+fit_rf_tuned
+```
+- Random Forest tuning shows possible improvement over baseline.
+
+- XGBoost can also be tuned further (learning rate, depth, rounds).
+
+- Oversampling/weighting can address imbalance.
+
+---
+
+# Task 7 — Comparison and conclusion
+
+```{r compare_final}
+summary_tbl <- tibble(
+  model = c("Random Forest", "XGBoost"),
+  accuracy = c(as.numeric(m_rf$accuracy), as.numeric(m_xgb$accuracy)),
+  macro_F1 = c(as.numeric(m_rf$macroF1), as.numeric(m_xgb$macroF1))
+) %>% arrange(desc(accuracy))
+
+summary_tbl
+
+# comparison plot
+summary_tbl %>%
+  gather(metric, value, -model) %>%
+  ggplot(aes(x = model, y = value, fill = metric)) +
+  geom_col(position = "dodge") +
+  labs(title = "Model Comparison: Accuracy vs Macro-F1", y = "Score", x = "Model") +
+  scale_fill_brewer(palette = "Set2")
+```
+
+---
+
+# Session Info
+
+```{r session}
+sessionInfo()
+```
